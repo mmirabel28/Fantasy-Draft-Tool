@@ -493,6 +493,9 @@ with col_main:
             [class*="st-key-recommendation_tile"] [data-testid="stVerticalBlock"] {
                 gap: 0.35rem;
             }
+            [class*="st-key-recommendation_tile"] .recommendation-player-name {
+                font-size: 125%;
+            }
             </style>
             """,
             unsafe_allow_html=True,
@@ -501,38 +504,29 @@ with col_main:
             p_name = row['PLAYER NAME']
             bye_val = row.get('Bye', '—')
 
-            # Create a visual status tag for rookies.
-            tags = []
-            if row['IsRookie']:
-                tags.append("`[ROOKIE]`")
-            tag_str = " " + " ".join(tags) if tags else ""
-
             with st.container(
                 border=True,
                 key=f"recommendation_tile_{rank}",
             ):
-                h1, h2 = st.columns([0.7, 0.3])
-                with h1:
+                rank_col, player_col, team_col, bye_col, risk_col, aim_col, draft_col = st.columns(
+                    [0.06, 0.27, 0.14, 0.10, 0.18, 0.11, 0.14]
+                )
+                with rank_col:
+                    st.markdown(f"**#{rank}**")
+                with player_col:
                     st.markdown(
-                        f"**#{rank} {p_name}** `[{row['CleanPos']} - {row['TEAM']}]`{tag_str} (Bye: {bye_val})"
+                        f'<span class="recommendation-player-name"><strong>{p_name}</strong></span>',
+                        unsafe_allow_html=True,
                     )
-                with h2:
-                    if "🚨" in row['SnipeLabel']:
-                        st.error(row['SnipeLabel'], icon=None)
-                    elif "⚠️" in row['SnipeLabel']:
-                        st.warning(row['SnipeLabel'], icon=None)
-                    else:
-                        st.success(row['SnipeLabel'], icon=None)
-
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("VBD", f"{row['VBD']:+.1f}")
-                m2.metric("xPTS", f"{row['xPTS']:.1f}")
-                m3.metric("Proj", f"{row['Adjusted_PROJ_PTS']:.1f}")
-                m4.metric("2026 ADP", f"{row['ADP']:.1f}")
-                m5.metric("AIM Score", f"{row['Adjusted_Score']:.1f}")
-
-                a1, a2 = st.columns([0.7, 0.3])
-                with a1:
+                with team_col:
+                    st.markdown(f"`{row['TEAM']} - {row['CleanPos']}`")
+                with bye_col:
+                    st.markdown(f"Bye: **{bye_val}**")
+                with risk_col:
+                    st.markdown(f"**{row['SnipeLabel']}**")
+                with aim_col:
+                    st.markdown(f"AIM: **{row['Adjusted_Score']:.1f}**")
+                with draft_col:
                     if st.button(
                         f"Drafted by Team {current_team}",
                         key=f"draft_{p_name}",
@@ -548,22 +542,32 @@ with col_main:
                         })
                         sync_my_team()
                         st.rerun()
-                with a2:
-                    if st.button(
-                        "Remove",
-                        key=f"remove_{p_name}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.dismissed_recommendations.add(p_name)
-                        st.rerun()
-                    with st.expander("🔍 News"):
+
+                with st.expander("Details"):
+                    metric_cols = st.columns(5)
+                    metric_cols[0].metric("VBD", f"{row['VBD']:+.1f}")
+                    metric_cols[1].metric("xPTS", f"{row['xPTS']:.1f}")
+                    metric_cols[2].metric("Proj", f"{row['Adjusted_PROJ_PTS']:.1f}")
+                    metric_cols[3].metric("ADP", f"{row['ADP']:.1f}")
+                    metric_cols[4].metric("AIM", f"{row['Adjusted_Score']:.1f}")
+
+                    detail_actions = st.columns(2)
+                    with detail_actions[0]:
                         if st.button(
-                            f"Search Web News",
+                            "Search Web News",
                             key=f"search_{p_name}",
                             use_container_width=True,
                         ):
                             with st.spinner("Searching latest news..."):
                                 st.info(search_player_news(p_name))
+                    with detail_actions[1]:
+                        if st.button(
+                            "Remove",
+                            key=f"remove_{p_name}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.dismissed_recommendations.add(p_name)
+                            st.rerun()
 
     st.header("📊 Interactive Snake Draft Board")
     if st.session_state.draft_history:
