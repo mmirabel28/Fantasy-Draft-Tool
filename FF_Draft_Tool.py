@@ -1,14 +1,9 @@
 import os
+import importlib
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 import streamlit as st
-
-# Preferred import with fallback to legacy package name
-try:
-    from ddgs import DDGS
-except ImportError:
-    from duckduckgo_search import DDGS
 
 st.set_page_config(page_title="Snake Master Draft Assistant", layout="wide")
 st.title("🐍 Reasoning Snake Draft Assistant (0.5 PPR)")
@@ -26,7 +21,7 @@ my_pick_pos = st.sidebar.number_input(
 
 st.sidebar.header("⚖️ Value Adjustments")
 
-# Dynamic Sliders for Rookies & Returning Injured Players
+# Dynamic Slider for Rookie Upside
 rookie_boost_pct = st.sidebar.slider(
     "Rookie Upside Boost (%)",
     min_value=0,
@@ -36,18 +31,8 @@ rookie_boost_pct = st.sidebar.slider(
     help="Increases 2026 projections for rookies to account for unmapped ceiling."
 )
 
-injury_bounceback_pct = st.sidebar.slider(
-    "Injury Recovery Multiplier (%)",
-    min_value=0,
-    max_value=20,
-    value=5,
-    step=1,
-    help="Applies a moderated boost to 2026 projections for players who missed significant time in 2025."
-)
-
-# Multiplier Conversions
+# Multiplier Conversion
 rookie_mult = 1.0 + (rookie_boost_pct / 100.0)
-injury_mult = 1.0 + (injury_bounceback_pct / 100.0)
 
 ROSTER_LIMITS = {
     'QB': 1,
@@ -103,11 +88,20 @@ HIGH_SCORING_TEAMS_BOOST = {
 }
 
 # ---------------------------------------------------------
-# 2. LOAD & MERGE DATA FILES (WITH DYNAMIC ROOKIE/INJURY MATH)
+# 2. LOAD & MERGE DATA FILES (WITH DYNAMIC ROOKIE MATH)
 # ---------------------------------------------------------
 @st.cache_data
-def load_and_blend_data(r_mult, i_mult):
+def load_and_blend_data(r_mult):
     base_dir = os.path.dirname(__file__)
+
+    def player_name_key(names):
+        return (
+            names.astype(str)
+            .str.replace(r'\s+(?:Jr\.?|Sr\.?|I{1,3}|IV|V)$', '', regex=True)
+            .str.replace(r'\s+', ' ', regex=True)
+            .str.strip()
+            .str.casefold()
+        )
 
     # 1. Primary Consensus Projections
     df_main = pd.read_csv(os.path.join(base_dir, "projections.csv"))
@@ -120,8 +114,11 @@ def load_and_blend_data(r_mult, i_mult):
     # 3. Load 2025 historical stats from Pro-Football-Reference data.
     df_pfr = pd.read_csv(os.path.join(base_dir, "history_2025_PFR.csv"))
     df_pfr['Player'] = df_pfr['Player'].str.replace(r'[*+]+$', '', regex=True).str.strip()
-    df_pfr['GS'] = pd.to_numeric(df_pfr['GS'], errors='coerce')
+    df_pfr['G'] = pd.to_numeric(df_pfr['G'], errors='coerce')
     df_pfr['FantPt'] = pd.to_numeric(df_pfr['FantPt'], errors='coerce')
+    df_pfr['Rec'] = pd.to_numeric(df_pfr['Rec'], errors='coerce')
+    df_main['_PlayerKey'] = player_name_key(df_main['PLAYER NAME'])
+    df_pfr['_PlayerKey'] = player_name_key(df_pfr['Player'])
 
     # Clean position mapping
     df_main['CleanPos'] = df_main['POS'].astype(str).str.extract(r'(QB|RB|WR|TE|K|DST|DEF)')
@@ -154,17 +151,24 @@ def load_and_blend_data(r_mult, i_mult):
         how='left',
     ).rename(columns={'FPTS': 'Projected_FPTS_2026'})
 
-    # Merge 2025 half-PPR fantasy points and games started from PFR.
+    # Merge 2025 half-PPR fantasy points and games played from PFR.
     df = df.merge(
-        df_pfr[['Player', 'FantPt', 'GS']].rename(
-            columns={'FantPt': 'FANTASYPTS', 'GS': 'Games_Started_2025'}
+        df_pfr[['_PlayerKey', 'Player', 'FantPt', 'Rec', 'G']].rename(
+            columns={
+                'FantPt': 'FANTASYPTS_BASE',
+                'Rec': 'Receptions_2025',
+                'G': 'Games_Played_2025',
+            }
         ),
-        left_on='PLAYER NAME',
-        right_on='Player',
+        left_on='_PlayerKey',
+        right_on='_PlayerKey',
         how='left',
     )
 
     df['PROJ_PTS'] = 300 - (df['ADP'] * 1.2)
+    df['FANTASYPTS'] = (
+        df['FANTASYPTS_BASE'] + (0.5 * df['Receptions_2025'])
+    )
     projected_positions = ['QB', 'RB', 'WR', 'TE']
     projection_mask = (
         df['CleanPos'].isin(projected_positions)
@@ -174,30 +178,29 @@ def load_and_blend_data(r_mult, i_mult):
         projection_mask, 'Projected_FPTS_2026'
     ]
 
-    # Detect Rookies and Returning Injured Players
-    df['IsRookie'] = df['ROOKIE'].fillna(False).astype(bool) if 'ROOKIE' in df.columns else False
-    df['InjuredLastYear'] = (
-        df['Games_Started_2025'].lt(17) & ~df['IsRookie']
+    # Normalize each player's 2025 production to a 17-game season.
+    df['FANTASYPTS_2025_17G'] = np.where(
+        df['Games_Played_2025'].gt(0),
+        df['FANTASYPTS'] / df['Games_Played_2025'] * 17,
+        np.nan,
     )
+
+    # Detect rookies and apply the configurable rookie upside boost.
+    df['IsRookie'] = df['ROOKIE'].fillna(False).astype(bool) if 'ROOKIE' in df.columns else False
     df['Adjusted_PROJ_PTS'] = df['PROJ_PTS']
     df.loc[df['IsRookie'], 'Adjusted_PROJ_PTS'] *= r_mult
-    effective_i_mult = 1.0 + ((i_mult - 1.0) * 0.5)
-    df.loc[df['InjuredLastYear'], 'Adjusted_PROJ_PTS'] *= effective_i_mult
 
-    # Dynamic xPTS calculation incorporating sidebar multipliers
+    # Blend normalized 2025 production with the 2026 projection.
     def calculate_xpts(row):
         proj = row['Adjusted_PROJ_PTS']
-        
-        # 1. Rookies: Apply dynamic rookie upside multiplier directly to 2026 projections
+
+        # Rookies have no 2025 production to blend in.
         if row['IsRookie']:
             return proj
-            
-        # 2. Injured Last Year: Apply dynamic recovery multiplier to 2026 projections
-        if row['InjuredLastYear']:
+
+        pts_2025 = row['FANTASYPTS_2025_17G']
+        if pd.isna(pts_2025):
             return proj
-            
-        # 3. Healthy Veterans: Position-specific historical weighting
-        pts_2025 = row['FANTASYPTS']
         if row['CleanPos'] == 'RB':
             return (0.15 * pts_2025) + (0.85 * proj)
         return (0.20 * pts_2025) + (0.80 * proj)
@@ -218,7 +221,7 @@ def load_and_blend_data(r_mult, i_mult):
     df['VBD'] = df.apply(lambda r: r['xPTS'] - replacement_pts.get(r['CleanPos'], 0.0), axis=1)
     return df
 
-data = load_and_blend_data(rookie_mult, injury_mult)
+data = load_and_blend_data(rookie_mult)
 
 # Initialize Session States
 if 'draft_history' not in st.session_state:
@@ -272,6 +275,22 @@ available = data[~data['PLAYER NAME'].isin(drafted_names)].copy()
 # ---------------------------------------------------------
 def search_player_news(player_name):
     try:
+        # Keep the optional news integration from blocking app startup when
+        # its native lxml dependency is unavailable or blocked by policy.
+        ddgs_module = None
+        for module_name in ('ddgs', 'duckduckgo_search'):
+            try:
+                ddgs_module = importlib.import_module(module_name)
+                break
+            except ImportError:
+                continue
+        if ddgs_module is None:
+            return (
+                "Web news search is unavailable because the DDGS package is "
+                "not installed. Install the packages in requirements.txt."
+            )
+        DDGS = ddgs_module.DDGS
+
         with DDGS() as ddgs:
             results = list(
                 ddgs.news(f"{player_name} NFL fantasy injury news", max_results=2)
@@ -284,8 +303,8 @@ def search_player_news(player_name):
                 for r in results
             ]
         )
-    except Exception:
-        return "Web news search unavailable."
+    except Exception as error:
+        return f"Web news search failed: {error}"
 
 def calculate_roster_fill(my_roster):
     counts = {
@@ -482,12 +501,10 @@ with col_main:
             p_name = row['PLAYER NAME']
             bye_val = row.get('Bye', '—')
 
-            # Create visual status tags for Rookies / Injured Players
+            # Create a visual status tag for rookies.
             tags = []
             if row['IsRookie']:
                 tags.append("`[ROOKIE]`")
-            if row['InjuredLastYear']:
-                tags.append("`[RECOVERING]`")
             tag_str = " " + " ".join(tags) if tags else ""
 
             with st.container(
