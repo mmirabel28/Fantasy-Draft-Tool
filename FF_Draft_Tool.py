@@ -1,11 +1,18 @@
 import os
 import importlib
+import re
+import time
 import numpy as np
 import pandas as pd
+import requests
 from scipy.stats import norm
 import streamlit as st
 
 st.set_page_config(page_title="Snake Master Draft Assistant", layout="wide")
+UNAVAILABLE_PLAYERS = {
+    'Brandon Aiyuk',
+    'Josh Jacobs',
+}
 st.title("🐍 Reasoning Snake Draft Assistant (0.5 PPR)")
 
 # ---------------------------------------------------------
@@ -17,6 +24,26 @@ num_teams = st.sidebar.number_input(
 )
 my_pick_pos = st.sidebar.number_input(
     "Your Draft Slot (1-12)", min_value=1, max_value=num_teams, value=1
+)
+
+st.sidebar.header("🔗 ESPN Live Sync")
+espn_league_id = st.sidebar.text_input("ESPN League ID", key="espn_league_id")
+espn_season = st.sidebar.number_input(
+    "ESPN Season", min_value=2020, max_value=2035, value=2026,
+    key="espn_season",
+)
+espn_s2 = st.sidebar.text_input(
+    "ESPN_S2 cookie", type="password", key="espn_s2",
+    help="Copy the espn_s2 cookie value from your ESPN browser session.",
+)
+espn_swid = st.sidebar.text_input(
+    "SWID cookie", type="password", key="espn_swid",
+    help="Copy the SWID cookie value, including braces, from your ESPN browser session.",
+)
+espn_auto_sync = st.sidebar.checkbox("Live sync", value=True, key="espn_auto_sync")
+espn_sync_seconds = st.sidebar.slider(
+    "Sync interval (seconds)", min_value=3, max_value=30, value=5,
+    key="espn_sync_seconds",
 )
 
 st.sidebar.header("⚖️ Value Adjustments")
@@ -230,6 +257,8 @@ if 'my_team' not in st.session_state:
     st.session_state.my_team = []
 if 'dismissed_recommendations' not in st.session_state:
     st.session_state.dismissed_recommendations = set()
+if 'espn_sync_error' not in st.session_state:
+    st.session_state.espn_sync_error = None
 
 if st.sidebar.button("Restore Removed Recommendations"):
     st.session_state.dismissed_recommendations.clear()
@@ -245,15 +274,125 @@ def sync_my_team():
 # ---------------------------------------------------------
 # 3. HELPER MATH FOR SNAKE DRAFTING
 # ---------------------------------------------------------
-total_picks_made = len(st.session_state.draft_history)
-current_pick_num = total_picks_made + 1
-current_round = ((current_pick_num - 1) // num_teams) + 1
-
 def get_team_on_clock(pick_num, total_teams):
     rnd = ((pick_num - 1) // total_teams) + 1
     pick_in_rnd = ((pick_num - 1) % total_teams) + 1
     return pick_in_rnd if rnd % 2 != 0 else (total_teams - pick_in_rnd + 1)
 
+def clean_player_name(name):
+    if not isinstance(name, str):
+        return ""
+    normalized = re.sub(r"[^\w\s]", "", name)
+    normalized = re.sub(
+        r"\b(Jr|Sr|II|III|IV|V)\b", "", normalized, flags=re.IGNORECASE
+    )
+    return " ".join(normalized.split()).casefold()
+
+def fetch_espn_draft_picks(league_id, season, espn_s2, swid):
+    url = (
+        "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/"
+        f"seasons/{int(season)}/segments/0/leagues/{league_id}"
+    )
+    try:
+        response = requests.get(
+            url,
+            params={"view": "mDraftDetail"},
+            cookies={"espn_s2": espn_s2, "SWID": swid},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload, None
+    except (requests.RequestException, ValueError, TypeError) as error:
+        return [], str(error)
+
+def sync_espn_draft(league_id, season, espn_s2, swid, player_data):
+    payload, error = fetch_espn_draft_picks(league_id, season, espn_s2, swid)
+    if error:
+        return False, 0, error
+
+    player_lookup = {
+        clean_player_name(row['PLAYER NAME']): row
+        for _, row in player_data.iterrows()
+    }
+    espn_players = {
+        str(player.get('id')): player
+        for player in payload.get('players', [])
+        if player.get('id') is not None
+    }
+    picks = payload.get('draftDetail', {}).get('picks', [])
+    synced_picks = []
+    position_map = {1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'DST'}
+    for index, pick in enumerate(picks, 1):
+        player_info = pick.get('playerPoolEntry', {}).get('player', {})
+        if not player_info and pick.get('playerId') is not None:
+            player_info = espn_players.get(str(pick['playerId']), {})
+        player_name = player_info.get('fullName', '').strip()
+        player_row = player_lookup.get(clean_player_name(player_name))
+        if player_row is None or not player_name:
+            continue
+
+        pick_num = int(
+            pick.get('overallPickNumber') or pick.get('pickNumber') or index
+        )
+        team_id = pick.get('teamId')
+        team_num = (
+            int(team_id)
+            if team_id is not None
+            else get_team_on_clock(pick_num, num_teams)
+        )
+        if team_num < 1 or team_num > num_teams:
+            team_num = get_team_on_clock(pick_num, num_teams)
+        synced_picks.append({
+            'pick_num': pick_num,
+            'round': int(
+                pick.get('roundId') or ((pick_num - 1) // num_teams) + 1
+            ),
+            'team_num': team_num,
+            'player_name': player_row['PLAYER NAME'],
+            'pos': player_row['CleanPos'] or position_map.get(
+                player_info.get('defaultPositionId'), ''
+            ),
+            'source': 'espn',
+        })
+
+    existing_manual = {
+        pick.get('pick_num'): pick
+        for pick in st.session_state.draft_history
+        if pick.get('source') != 'espn'
+    }
+    merged = existing_manual.copy()
+    merged.update({pick['pick_num']: pick for pick in synced_picks})
+    new_history = [merged[pick_num] for pick_num in sorted(merged)]
+    changed = new_history != st.session_state.draft_history
+    if changed:
+        st.session_state.draft_history = new_history
+        sync_my_team()
+    return changed, len(synced_picks), None
+
+if espn_auto_sync and espn_league_id and espn_s2 and espn_swid:
+    _, espn_pick_count, st.session_state.espn_sync_error = sync_espn_draft(
+        espn_league_id, espn_season, espn_s2, espn_swid, data
+    )
+elif espn_league_id or espn_s2 or espn_swid:
+    st.session_state.espn_sync_error = "Enter the league ID and both ESPN cookies to connect."
+else:
+    st.session_state.espn_sync_error = None
+
+if st.session_state.espn_sync_error:
+    st.sidebar.warning(st.session_state.espn_sync_error)
+elif espn_auto_sync and espn_league_id:
+    if espn_pick_count:
+        st.sidebar.success(f"ESPN connected: {espn_pick_count} picks synced")
+    else:
+        st.sidebar.warning(
+            "ESPN connected, but no picks were returned. Practice/mock drafts "
+            "may not publish picks through the league draft API."
+        )
+
+total_picks_made = len(st.session_state.draft_history)
+current_pick_num = total_picks_made + 1
+current_round = ((current_pick_num - 1) // num_teams) + 1
 current_team = get_team_on_clock(current_pick_num, num_teams)
 
 def picks_until_next_turn(current_pick, user_slot, total_teams, total_rounds):
@@ -361,6 +500,15 @@ def calculate_top_5_recommendations(
     df_filtered = df[
         df['CleanPos'].isin(['QB', 'RB', 'WR', 'TE', 'DST', 'K'])
     ].copy()
+    df_filtered = df_filtered[
+        ~df_filtered['PLAYER NAME'].isin(UNAVAILABLE_PLAYERS)
+    ]
+    team_labels = df_filtered['TEAM'].fillna('').astype(str).str.strip().str.upper()
+    df_filtered = df_filtered[
+        ~team_labels.isin(['', 'FA', 'UFA', 'FREE AGENT'])
+    ]
+    if filled.get('TE', 0) >= ROSTER_LIMITS['TE']:
+        df_filtered = df_filtered[df_filtered['CleanPos'] != 'TE']
 
     if position_filter == 'FLEX (WR/RB/TE)':
         df_filtered = df_filtered[df_filtered['CleanPos'].isin(['RB', 'WR', 'TE'])]
@@ -444,6 +592,29 @@ def style_draft_board(val):
             )
     return ""
 
+
+def style_risk_badge(label):
+    if not isinstance(label, str):
+        return "**—**"
+
+    text = label.upper()
+    if "HIGH RISK" in text:
+        bg_color, text_color = "#dc2626", "#ffffff"
+    elif "MOD RISK" in text:
+        bg_color, text_color = "#facc15", "#1f2937"
+    elif "SAFE" in text or "ON CLOCK" in text:
+        bg_color, text_color = "#22c55e", "#ffffff"
+    else:
+        return f"**{label}**"
+
+    return (
+        '<span style="display:inline-block; padding:0.25rem 0.55rem; '
+        'border-radius:999px; font-size:0.78rem; font-weight:700; '
+        f'background-color:{bg_color}; color:{text_color}; '
+        'line-height:1.2; white-space:nowrap;">'
+        f'{label}</span>'
+    )
+
 # ---------------------------------------------------------
 # 5. STREAMLIT LAYOUT DEFINITION (COLUMNS)
 # ---------------------------------------------------------
@@ -523,7 +694,7 @@ with col_main:
                 with bye_col:
                     st.markdown(f"Bye: **{bye_val}**")
                 with risk_col:
-                    st.markdown(f"**{row['SnipeLabel']}**")
+                    st.markdown(style_risk_badge(row['SnipeLabel']), unsafe_allow_html=True)
                 with aim_col:
                     st.markdown(f"AIM: **{row['Adjusted_Score']:.1f}**")
                 with draft_col:
@@ -592,7 +763,9 @@ with col_main:
 # --- RIGHT / SIDE COLUMN ---
 with col_side:
     st.header("⚡ Quick Select: Top 10 ADP Available")
-    top_10_adp = available.sort_values(by='ADP', ascending=True).head(10)
+    top_10_adp = available[
+        ~available['PLAYER NAME'].isin(UNAVAILABLE_PLAYERS)
+    ].sort_values(by='ADP', ascending=True).head(10)
 
     if not top_10_adp.empty:
         for idx, (_, t10_row) in enumerate(top_10_adp.iterrows(), 1):
@@ -691,3 +864,7 @@ with col_side:
             st.write(f"• **{p['Position']}:** {p['Name']}")
     else:
         st.write("*No players drafted yet.*")
+
+if espn_auto_sync and espn_league_id and espn_s2 and espn_swid:
+    time.sleep(espn_sync_seconds)
+    st.rerun()
